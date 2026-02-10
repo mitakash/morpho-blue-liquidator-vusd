@@ -327,3 +327,40 @@ This way you can have different containers storing different indexing data for d
 
 - If you're using Docker to run the local Postgres database, just change the port both in the postgres url given to ponder (line 93 in `apps/ponder/ponder.config.ts`, the current port being `5432`) and in `docker-compose.yml` (make sure to set the same port, and to remember the port used by each config).
 - If you are using an external postgres database, you just need to change the `POSTGRES_DATABASE_URL`.
+---------------------------------------------------------------------------------------------------------------
+
+# Morpho Blue Liquidation Bot (VUSD Specialized Fork)
+
+This is a specialized fork of the Morpho Blue Liquidation Bot, enhanced to support the **Vetro Protocol** and its native pegged stablecoin, **VUSD**.
+
+## specialized VUSD Integration
+
+This repository includes proven scripts for interacting with the Vetro Gateway, supporting both instant and delayed redemption paths.
+
+### 🔑 Environment Configuration
+Your `.env` file must now contain two private keys to test both logic paths:
+- `LIQUIDATION_PRIVATE_KEY_1`: Your primary bot wallet (Whitelisted for instant redeem).
+- `LIQUIDATION_PRIVATE_KEY_2`: A secondary test wallet (Subject to the 70s withdrawal delay).
+
+### 🛠 Redemption Flows
+
+#### Path A: Instant Redeem (Whitelisted)
+Used for high-priority bot wallets that bypass the protocol delay.
+* **Script**: `apps/client/src/redeem-fast-path.ts`
+* **Wallet**: Uses `LIQUIDATION_PRIVATE_KEY_1`.
+* **Action**: Calls `redeem()` directly to burn TESTUSD and receive USDC in one step.
+
+#### Path B: Two-Step Redeem (Non-Whitelisted)
+Used for standard users or new liquidators subject to the **70-second** cooldown.
+1. **Minting**: Run `apps/client/src/mint-testusdPrivKey2.ts` to get TESTUSD for the second wallet.
+2. **Step 1 (Request)**: Run `apps/client/src/redeem-step1-request.ts` to lock tokens in the Gateway and start the timer.
+3. **Wait**: Cooldown is currently set to **70 seconds**.
+4. **Step 2 (Claim)**: Run `apps/client/src/redeem-step2-claim.ts` to release the USDC once the cooldown matures.
+
+## Usage Example
+```bash
+# Execute instant redeem for the bot wallet
+npx tsx apps/client/src/redeem-fast-path.ts
+
+# Execute a delayed claim for the secondary wallet
+npx tsx apps/client/src/redeem-step2-claim.ts
