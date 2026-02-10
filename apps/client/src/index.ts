@@ -3,50 +3,52 @@ import { createWalletClient, Hex, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { watchBlocks } from "viem/actions";
 
+// 1. Remove ALL extensions. tsx will resolve these to .ts automatically.
+import { CurveVenue } from "./liquidityVenues/curve"; 
+import { OneInch } from "./liquidityVenues/1inch/index"; 
 import { LiquidationBot, type LiquidationBotInputs } from "./bot";
 import { Erc20Wrapper } from "./liquidityVenues/erc20Wrapper";
 import { Erc4626 } from "./liquidityVenues/erc4626";
 import type { LiquidityVenue } from "./liquidityVenues/liquidityVenue";
 import { UniswapV3Venue } from "./liquidityVenues/uniswapV3";
 import { UniswapV4Venue } from "./liquidityVenues/uniswapV4";
-import { ChainlinkPricer, DefiLlamaPricer } from "./pricers";
+import { ChainlinkPricer, DefiLlamaPricer } from "./pricers/index";
 import type { Pricer } from "./pricers/pricer";
 
 export const launchBot = (config: ChainConfig) => {
   const logTag = `[${config.chain.name} client]: `;
   console.log(`${logTag}Starting up`);
 
+
+  // Use the same hardened transport logic here
   const client = createWalletClient({
     chain: config.chain,
-    transport: http(config.rpcUrl),
+    transport: http(config.rpcUrl, {
+      timeout: 30_000,
+      retryCount: 5,
+      batch: false // Match the direct-listener to avoid Cloudflare 1015
+    }),
     account: privateKeyToAccount(config.liquidationPrivateKey),
+    pollingInterval: 6_000, // Match your 6s interval
   });
 
-  // LIQUIDITY VENUES
   const liquidityVenues: LiquidityVenue[] = [];
+  liquidityVenues.push(new CurveVenue());
+  liquidityVenues.push(new OneInch());
   liquidityVenues.push(new Erc20Wrapper());
   liquidityVenues.push(new Erc4626());
   liquidityVenues.push(new UniswapV3Venue());
   liquidityVenues.push(new UniswapV4Venue());
 
-  // PRICERS
   const pricers: Pricer[] = [];
   pricers.push(new DefiLlamaPricer());
   pricers.push(new ChainlinkPricer());
 
-  if (config.checkProfit && pricers.length === 0) {
-    throw new Error(`${logTag} You must configure pricers!`);
-  }
-
   let flashbotAccount = undefined;
   if (config.useFlashbots) {
-    const flashbotsPrivateKey = process.env.FLASHBOTS_PRIVATE_KEY;
-
-    if (flashbotsPrivateKey === undefined) {
-      throw new Error(`${logTag} FLASHBOTS_PRIVATE_KEY is not set`);
-    }
-
-    flashbotAccount = privateKeyToAccount(process.env.FLASHBOTS_PRIVATE_KEY as Hex);
+    const flashbotsPrivateKey = process.env.FLASHBOTS_PRIVATE_KEY as Hex;
+    if (!flashbotsPrivateKey) throw new Error(`${logTag} FLASHBOTS_PRIVATE_KEY is not set`);
+    flashbotAccount = privateKeyToAccount(flashbotsPrivateKey);
   }
 
   const inputs: LiquidationBotInputs = {
@@ -65,20 +67,5 @@ export const launchBot = (config: ChainConfig) => {
   };
 
   const bot = new LiquidationBot(inputs);
-
-  const blockInterval = config.blockInterval ?? 1;
-  let count = 0;
-
-  watchBlocks(client, {
-    onBlock: () => {
-      if (count % blockInterval === 0) {
-        try {
-          void bot.run();
-        } catch (e) {
-          console.error(`${logTag} uncaught error in bot.run():`, e);
-        }
-      }
-      count++;
-    },
-  });
+  watchBlocks(client, { onBlock: () => void bot.run() });
 };

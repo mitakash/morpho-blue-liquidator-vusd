@@ -17,6 +17,12 @@ async function run() {
     const rpcUrl = process.env[`RPC_URL_${id}`] ?? chain.rpcUrls.default.http[0];
     const privateKey = process.env[`LIQUIDATION_PRIVATE_KEY_${id}`];
 
+    // Skip chains not configured in .env instead of throwing an error
+    if (!rpcUrl || !privateKey) {
+      console.log(`Skipping chain ${id}: Credentials not found in .env`);
+      continue; 
+    }
+
     if (!rpcUrl) {
       throw new Error(`RPC_URL_${id} is not set`);
     }

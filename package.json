@@ -11,7 +11,7 @@
     "test:bot": "pnpm build:config &&vitest bot",
     "build:config": "pnpm --filter @morpho-blue-liquidation-bot/config build",
     "deploy:executor": "pnpm build:config && tsx apps/client/src/deployExecutor.ts",
-    "liquidate": "pnpm build:config && tsx apps/client/src/script.ts --env-file=.env",
+    "liquidate:direct": "tsx --no-warnings apps/client/src/direct-listener.ts",
     "skim": "pnpm build:config && tsx apps/client/src/skim.ts --env-file=.env"
   },
   "lint-staged": {
@@ -22,6 +22,7 @@
   "dependencies": {
     "@morpho-org/blue-sdk": "^3.0.9",
     "ponder": "^0.13.6",
+    "solc": "^0.8.33",
     "tsx": "^4.19.3",
     "viem": "^2.37.0"
   },

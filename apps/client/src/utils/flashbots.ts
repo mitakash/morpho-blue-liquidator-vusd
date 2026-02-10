@@ -11,6 +11,8 @@ import {
   stringToBytes,
 } from "viem";
 import { estimateGas, getTransactionCount } from "viem/actions";
+import { nonceTracker } from "./nonce";
+
 
 export namespace Flashbots {
   let nextId = 0;
@@ -39,19 +41,21 @@ export namespace Flashbots {
       client: client;
     }[],
   ) {
-    const nonces: { [address: string]: number } = {};
 
     const signatures: Hex[] = [];
+  
     for (const { transaction, client } of bundle) {
-      const address = client.account.address;
+      // Use the singleton tracker instead of local fallbacks
+      transaction.nonce = await nonceTracker.getNonce(client);
 
-      const nonce =
-        transaction.nonce ?? nonces[address] ?? (await getTransactionCount(client, { address }));
+      // 2. PEDANTIC FIX: Wrap estimateGas in a try/catch. 
+      // Flashloans often cause gas estimation to revert because you don't hold the assets yet.
+      try {
+        transaction.gas ??= await estimateGas(client, transaction);
+      } catch (e) {
+        transaction.gas = 1_000_000n; // Safe hardcoded limit for complex liquidations
+      }      
 
-      nonces[address] = nonce + 1;
-      transaction.nonce ??= nonce;
-
-      transaction.gas ??= await estimateGas(client, transaction); // TODO: Add target block number and timestamp when supported by geth
 
       signatures.push(await client.signTransaction(transaction));
     }

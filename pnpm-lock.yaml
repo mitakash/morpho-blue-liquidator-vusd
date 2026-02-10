@@ -16,6 +16,9 @@ importers:
       ponder:
         specifier: ^0.13.6
         version: 0.13.7(@opentelemetry/api@1.9.0)(@types/node@20.17.28)(bufferutil@4.0.9)(hono@4.7.5)(typescript@5.8.2)(utf-8-validate@5.0.10)(viem@2.38.6(bufferutil@4.0.9)(typescript@5.8.2)(utf-8-validate@5.0.10))
+      solc:
+        specifier: ^0.8.33
+        version: 0.8.33
       tsx:
         specifier: ^4.19.3
         version: 4.19.3
@@ -1299,6 +1302,7 @@ packages:
   '@uniswap/swap-router-contracts@1.3.1':
     resolution: {integrity: sha512-mh/YNbwKb7Mut96VuEtL+Z5bRe0xVIbjjiryn+iMMrK2sFKhR4duk/86mEz0UO5gSx4pQIw9G5276P5heY/7Rg==}
     engines: {node: '>=10'}
+    deprecated: Package no longer supported. Contact Support at https://www.npmjs.com/support for more info.
 
   '@uniswap/universal-router-sdk@4.19.5':
     resolution: {integrity: sha512-FpfvTrJnvxhLdfX1N+GqOfAbHEsbFHP7J3JbpSAFWl3QDW63BB1/rqgW3E17xQha+WnPdP7uMLHwe7oi6mr39Q==}
@@ -3264,6 +3268,11 @@ packages:
     engines: {node: '>=10.0.0'}
     hasBin: true
 
+  solc@0.8.33:
+    resolution: {integrity: sha512-qPdHuAeg+DccqYz4Mq4grc7lOdgLA8wB8meCrMHcVXj70noKZhfAMzOCcOD/4RODZnn+sV3V6fWEyUkeVaBPVQ==}
+    engines: {node: '>=12.0.0'}
+    hasBin: true
+
   sonic-boom@3.8.1:
     resolution: {integrity: sha512-y4Z8LCDBuum+PBP3lSV7RHrXscqksve/bi0as7mhwVnBW+/wUqKT/2Kb7um8yqcFy0duYbbPxzt89Zy2nOCaxg==}
 
@@ -3707,6 +3716,7 @@ packages:
   whatwg-encoding@3.1.1:
     resolution: {integrity: sha512-6qN4hJdMwfYBtE3YBTTHhoeuUrDBPZmbQaxWAqSALV/MeEnR5z1xd8UKud2RAkFoPkmB+hli1TZSnyi84xz1vQ==}
     engines: {node: '>=18'}
+    deprecated: Use @exodus/bytes instead for a more spec-conformant and faster implementation
 
   whatwg-mimetype@4.0.0:
     resolution: {integrity: sha512-QaKxh0eNIi2mE9p2vEdzfagOKHCcj1pJ56EEHGQOVxp8r9/iszLUUV7v89x9O1p/T+NlTM5W7jW6+cz4Fq1YVg==}
@@ -5914,15 +5924,13 @@ snapshots:
     dependencies:
       delayed-stream: 1.0.0
 
-  command-exists@1.2.9:
-    optional: true
+  command-exists@1.2.9: {}
 
   commander@12.1.0: {}
 
   commander@13.1.0: {}
 
-  commander@8.3.0:
-    optional: true
+  commander@8.3.0: {}
 
   concat-map@0.0.1: {}
 
@@ -6539,7 +6547,6 @@ snapshots:
   follow-redirects@1.15.9(debug@4.4.0):
     optionalDependencies:
       debug: 4.4.0(supports-color@8.1.1)
-    optional: true
 
   foreground-child@3.3.1:
     dependencies:
@@ -6894,8 +6901,7 @@ snapshots:
     optionalDependencies:
       '@pkgjs/parseargs': 0.11.0
 
-  js-sha3@0.8.0:
-    optional: true
+  js-sha3@0.8.0: {}
 
   js-tokens@4.0.0: {}
 
@@ -7045,8 +7051,7 @@ snapshots:
 
   math-intrinsics@1.1.0: {}
 
-  memorystream@0.3.1:
-    optional: true
+  memorystream@0.3.1: {}
 
   merge-stream@2.0.0: {}
 
@@ -7204,8 +7209,7 @@ snapshots:
       type-check: 0.4.0
       word-wrap: 1.2.5
 
-  os-tmpdir@1.0.2:
-    optional: true
+  os-tmpdir@1.0.2: {}
 
   outvariant@1.4.3: {}
 
@@ -7633,8 +7637,7 @@ snapshots:
 
   semver-compare@1.0.0: {}
 
-  semver@5.7.2:
-    optional: true
+  semver@5.7.2: {}
 
   semver@6.3.1:
     optional: true
@@ -7687,6 +7690,18 @@ snapshots:
     transitivePeerDependencies:
       - debug
     optional: true
+
+  solc@0.8.33:
+    dependencies:
+      command-exists: 1.2.9
+      commander: 8.3.0
+      follow-redirects: 1.15.9(debug@4.4.0)
+      js-sha3: 0.8.0
+      memorystream: 0.3.1
+      semver: 5.7.2
+      tmp: 0.0.33
+    transitivePeerDependencies:
+      - debug
 
   sonic-boom@3.8.1:
     dependencies:
@@ -7831,7 +7846,6 @@ snapshots:
   tmp@0.0.33:
     dependencies:
       os-tmpdir: 1.0.2
-    optional: true
 
   to-regex-range@5.0.1:
     dependencies:
