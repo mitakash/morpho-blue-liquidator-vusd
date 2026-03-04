@@ -1,7 +1,9 @@
 import { ALWAYS_REALIZE_BAD_DEBT, chainConfigs } from "@morpho-blue-liquidation-bot/config";
 import { type IMarket, type IMarketParams, MarketUtils } from "@morpho-org/blue-sdk";
+import { blueAbi as morphoBlueAbi } from "@morpho-org/blue-sdk-viem";
 import { executorAbi } from "executooor-viem";
 import {
+  encodeFunctionData,
   erc20Abi,
   formatUnits,
   getAddress,
@@ -23,22 +25,21 @@ import {
   writeContract,
 } from "viem/actions";
 
+import { HemiLiquidator, CRV_USD, HEMI_BTC } from "./liquidator.js";
 import type { LiquidityVenue } from "./liquidityVenues/liquidityVenue.js";
 import type { Pricer } from "./pricers/pricer.js";
 import { CooldownMechanism } from "./utils/cooldownMechanism.js";
 import { fetchWhitelistedVaults } from "./utils/fetch-whitelisted-vaults.js";
 import { fetchLiquidatablePositions, fetchMarketsForVaults } from "./utils/fetchers.js";
+import { Flashbots } from "./utils/flashbots.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
+import { nonceTracker } from "./utils/nonce";
 import type {
   IndexerAPIResponse,
   LiquidatablePosition,
   PreLiquidatablePosition,
 } from "./utils/types.js";
-import { Flashbots } from "./utils/flashbots.js";
-// 1. IMPORT: Keep the .js extension for ESM compatibility
-import { HemiLiquidator, CRV_USD, VUSD, HEMI_BTC } from "./liquidator.js";
-import { nonceTracker } from "./utils/nonce";
 
 export interface LiquidationBotInputs {
   logTag: string;
@@ -120,7 +121,7 @@ export class LiquidationBot {
     const marketParams = market.params;
 
     const badDebtPosition = position.seizableCollateral === position.collateral;
-    
+
     const marketId = MarketUtils.getMarketId(marketParams);
 
     // Define your specific test market ID constant
@@ -132,11 +133,9 @@ export class LiquidationBot {
         return await this.executeHemiSpecialLoop(market, position);
       } catch (error) {
         console.error(`${this.logTag} ❌ Hemi Loop Failed:`, error);
-      return;
+        return;
       }
     }
-
-
 
     if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) return;
 
@@ -189,53 +188,59 @@ export class LiquidationBot {
     }
   }
 
- /**
- * Encapsulated Hemi-Specific Logic
- * This keeps the main bot logic generic while allowing your specific test to run.
- */
+  /**
+   * Encapsulated Hemi-Specific Logic
+   * This keeps the main bot logic generic while allowing your specific test to run.
+   */
   private async executeHemiSpecialLoop(market: IMarket, position: LiquidatablePosition) {
     const { client, executorAddress } = this;
     const encoder = new LiquidationEncoder(executorAddress, client);
     const hemiLiquidator = new HemiLiquidator();
-    
+
     // Use the 90 VUSD debt found in your audit
-    // We flashloan 91 crvUSD to cover the Curve price impact you found (~89.66 output) 
-    const flashLoanAmount = parseUnits("91", 18); 
+    // We flashloan 91 crvUSD to cover the Curve price impact you found (~89.66 output)
+    const flashLoanAmount = parseUnits("91", 18);
 
     const curveSwap = hemiLiquidator.encodeCrvUsdToVusd(flashLoanAmount);
     const { to: router, data: swapData } = await hemiLiquidator.getRepaymentSwapData(
-        position.seizableCollateral,
-        executorAddress,
-        process.env.ONE_INCH_SWAP_API_KEY!
+      position.seizableCollateral,
+      executorAddress,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      process.env.ONE_INCH_SWAP_API_KEY!,
     );
 
     const callback: Hex[] = [
-        // 1. Give Curve permission to take the crvUSD we just flashloaned
-        encoder.erc20Approve(CRV_USD, "0xb1c189dfde178fe9f90e72727837cc9289fb944f", maxUint256),
-        curveSwap,
-        
-        // 2. Give Morpho permission to take the VUSD we just got from Curve
-        // NOTE: Use getAddress(market.params.loanToken) here for safety
-        encoder.erc20Approve(getAddress(market.params.loanToken), this.morphoAddress, maxUint256),
-        encodeFunctionData({
-            abi: morphoBlueAbi,
-            functionName: "liquidate",
-            args: [market.params, position.user, position.seizableCollateral, 0n, "0x"],
-        }),
-        
-        // 3. Give 1inch permission to take the HemiBTC we just seized
-        encoder.erc20Approve(HEMI_BTC, router, maxUint256),
-        swapData
+      // 1. Give Curve permission to take the crvUSD we just flashloaned
+      encoder.erc20Approve(CRV_USD, "0xb1c189dfde178fe9f90e72727837cc9289fb944f", maxUint256),
+      curveSwap,
+
+      // 2. Give Morpho permission to take the VUSD we just got from Curve
+      // NOTE: Use getAddress(market.params.loanToken) here for safety
+      encoder.erc20Approve(getAddress(market.params.loanToken), this.morphoAddress, maxUint256),
+      encodeFunctionData({
+        abi: morphoBlueAbi,
+        functionName: "liquidate",
+        args: [market.params, position.user, position.seizableCollateral, 0n, "0x"],
+      }),
+
+      // 3. Give 1inch permission to take the HemiBTC we just seized
+      encoder.erc20Approve(HEMI_BTC, router, maxUint256),
+      swapData,
     ];
 
     // Wrap the entire sequence in a Morpho Flashloan [cite: 28, 29]
-    encoder.morphoBlueFlashLoan(this.morphoAddress, CRV_USD, flashLoanAmount, encoder.flush(callback));
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    encoder.morphoBlueFlashLoan(
+      this.morphoAddress,
+      CRV_USD,
+      flashLoanAmount,
+      encoder.flush(callback),
+    );
     encoder.erc20Skim(CRV_USD, this.treasuryAddress);
 
     const finalCalls = encoder.flush();
     return await this.handleTx(encoder, finalCalls, market.params, false);
   }
-
 
   private async preLiquidate(market: IMarket, position: PreLiquidatablePosition) {
     const marketParams = market.params;
@@ -287,14 +292,12 @@ export class LiquidationBot {
     }
   }
 
-private async handleTx(
+  private async handleTx(
     encoder: LiquidationEncoder,
     calls: Hex[],
     marketParams: IMarketParams,
     badDebtPosition: boolean,
   ) {
-    //extra logging
-    console.log(`Potential liquidation found for user: ${position.user}`);	  
     const functionData = {
       abi: executorAbi,
       functionName: "exec_606BaXt",
@@ -360,15 +363,15 @@ private async handleTx(
           this.flashbotAccount,
         );
       } else {
-        await writeContract(this.client, { 
-          address: encoder.address, 
-          ...functionData, 
-          nonce 
+        await writeContract(this.client, {
+          address: encoder.address,
+          ...functionData,
+          nonce,
         });
       }
       return true;
     });
-  } 
+  }
 
   private async convertCollateralToLoan(
     marketParams: IMarketParams,
@@ -430,6 +433,7 @@ private async handleTx(
     },
     badDebtPosition: boolean,
   ) {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     if (ALWAYS_REALIZE_BAD_DEBT && badDebtPosition) return true;
     if (this.pricers === undefined) return true;
 
@@ -448,8 +452,10 @@ private async handleTx(
     if (loanAssetProfitUsd === undefined || gasUsedUsd === undefined) return false;
 
     const profitUsd = loanAssetProfitUsd - gasUsedUsd;
-    
-    console.log(`💰 Profit Check Result: ${profitUsd > 0 ? '✅' : '❌'} $${profitUsd.toString()} (Profit: $${loanAssetProfitUsd.toString()} | Gas: $${gasUsedUsd.toString()})`);
+
+    console.log(
+      `💰 Profit Check Result: ${profitUsd > 0 ? "✅" : "❌"} $${profitUsd.toString()} (Profit: $${loanAssetProfitUsd.toString()} | Gas: $${gasUsedUsd.toString()})`,
+    );
 
     return profitUsd > 0;
   }
