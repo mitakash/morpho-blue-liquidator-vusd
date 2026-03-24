@@ -1,9 +1,7 @@
 import { ALWAYS_REALIZE_BAD_DEBT, chainConfigs } from "@morpho-blue-liquidation-bot/config";
 import { type IMarket, type IMarketParams, MarketUtils } from "@morpho-org/blue-sdk";
-import { blueAbi as morphoBlueAbi } from "@morpho-org/blue-sdk-viem";
 import { executorAbi } from "executooor-viem";
 import {
-  encodeFunctionData,
   erc20Abi,
   formatUnits,
   getAddress,
@@ -124,11 +122,9 @@ export class LiquidationBot {
 
     const marketId = MarketUtils.getMarketId(marketParams);
 
-    // Define your specific test market ID constant
     const HEMI_TEST_MARKET = "0xc48fbb6ac634123f64461e546a6e5bd06bbfa65adae19e9172a8bb4456b932ca";
 
-    // Check if we are in the special test market
-    if (marketId === HEMI_TEST_MARKET) {
+    if ((marketId as string) === HEMI_TEST_MARKET) {
       try {
         return await this.executeHemiSpecialLoop(market, position);
       } catch (error) {
@@ -189,19 +185,20 @@ export class LiquidationBot {
   }
 
   /**
-   * Encapsulated Hemi-Specific Logic
-   * This keeps the main bot logic generic while allowing your specific test to run.
+   * Hemi-specific liquidation via flash loan.
+   *
+   * Flow: flash loan crvUSD → Curve swap to VUSD → Morpho liquidate (repay VUSD, seize HemiBTC)
+   *       → 1inch swap HemiBTC back to crvUSD → repay flash loan → keep profit.
    */
   private async executeHemiSpecialLoop(market: IMarket, position: LiquidatablePosition) {
-    const { client, executorAddress } = this;
-    const encoder = new LiquidationEncoder(executorAddress, client);
+    const { executorAddress } = this;
+    const encoder = new LiquidationEncoder(executorAddress, this.client);
     const hemiLiquidator = new HemiLiquidator();
 
-    // Use the 90 VUSD debt found in your audit
-    // We flashloan 91 crvUSD to cover the Curve price impact you found (~89.66 output)
     const flashLoanAmount = parseUnits("91", 18);
+    const curvePool: Address = "0xb1c189dfde178fe9f90e72727837cc9289fb944f";
 
-    const curveSwap = hemiLiquidator.encodeCrvUsdToVusd(flashLoanAmount);
+    const curveSwapData = hemiLiquidator.encodeCrvUsdToVusd(flashLoanAmount);
     const { to: router, data: swapData } = await hemiLiquidator.getRepaymentSwapData(
       position.seizableCollateral,
       executorAddress,
@@ -209,33 +206,32 @@ export class LiquidationBot {
       process.env.ONE_INCH_SWAP_API_KEY!,
     );
 
-    const callback: Hex[] = [
-      // 1. Give Curve permission to take the crvUSD we just flashloaned
-      encoder.erc20Approve(CRV_USD, "0xb1c189dfde178fe9f90e72727837cc9289fb944f", maxUint256),
-      curveSwap,
+    // Build the flash loan callback sequence using the encoder's internal buffer:
 
-      // 2. Give Morpho permission to take the VUSD we just got from Curve
-      // NOTE: Use getAddress(market.params.loanToken) here for safety
-      encoder.erc20Approve(getAddress(market.params.loanToken), this.morphoAddress, maxUint256),
-      encodeFunctionData({
-        abi: morphoBlueAbi,
-        functionName: "liquidate",
-        args: [market.params, position.user, position.seizableCollateral, 0n, "0x"],
-      }),
-
-      // 3. Give 1inch permission to take the HemiBTC we just seized
-      encoder.erc20Approve(HEMI_BTC, router, maxUint256),
-      swapData,
-    ];
-
-    // Wrap the entire sequence in a Morpho Flashloan [cite: 28, 29]
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-    encoder.morphoBlueFlashLoan(
+    // 1. Approve Curve pool to take crvUSD
+    encoder.erc20Approve(CRV_USD, curvePool, maxUint256);
+    // 2. Curve swap: crvUSD → VUSD
+    encoder.pushCall(curvePool, 0n, curveSwapData);
+    // 3. Approve Morpho to take VUSD for liquidation repayment
+    encoder.erc20Approve(getAddress(market.params.loanToken), this.morphoAddress, maxUint256);
+    // 4. Liquidate: repay VUSD debt, seize HemiBTC (no callback needed — VUSD is already available)
+    encoder.morphoBlueLiquidate(
       this.morphoAddress,
-      CRV_USD,
-      flashLoanAmount,
-      encoder.flush(callback),
+      { ...market.params, lltv: BigInt(market.params.lltv) },
+      position.user,
+      position.seizableCollateral,
+      0n,
     );
+    // 5. Approve 1inch router to take seized HemiBTC
+    encoder.erc20Approve(HEMI_BTC, router, maxUint256);
+    // 6. 1inch swap: HemiBTC → crvUSD to repay flash loan
+    encoder.pushCall(router, 0n, swapData);
+
+    // Flush all callback calls, then wrap in flash loan
+    const callbackCalls = encoder.flush();
+    encoder.blueFlashLoan(this.morphoAddress, CRV_USD, flashLoanAmount, callbackCalls);
+
+    // Sweep remaining crvUSD profit to treasury
     encoder.erc20Skim(CRV_USD, this.treasuryAddress);
 
     const finalCalls = encoder.flush();

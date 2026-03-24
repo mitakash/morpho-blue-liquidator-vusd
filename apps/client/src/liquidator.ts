@@ -14,21 +14,23 @@ import { type Address, type Hex, encodeFunctionData, getAddress } from "viem";
 export const CRV_USD = getAddress("0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E");
 export const VUSD = getAddress("0x677ddbd918637E5F2c79e164D402454dE7dA8619");
 export const HEMI_BTC = getAddress("0x06ea695B91700071B161A434fED42D1DcbAD9f00");
-export const TARGET_MARKET_ID = "0xc48fbb6ac634123f64461e546a6e5bd06bbfa65adae19e9172a8bb4456b932ca";
-const POOL = getAddress("0xb1c189dfde178fe9f90e72727837cc9289fb944f");
+export const TARGET_MARKET_ID =
+  "0xc48fbb6ac634123f64461e546a6e5bd06bbfa65adae19e9172a8bb4456b932ca";
 
-const CURVE_ABI = [{
-  name: "exchange",
-  type: "function",
-  stateMutability: "nonpayable",
-  inputs: [
-    { name: "i", type: "int128" },
-    { name: "j", type: "int128" },
-    { name: "_dx", type: "uint256" },
-    { name: "_min_dy", type: "uint256" }
-  ],
-  outputs: [{ name: "", type: "uint256" }]
-}] as const;
+const CURVE_ABI = [
+  {
+    name: "exchange",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "i", type: "int128" },
+      { name: "j", type: "int128" },
+      { name: "_dx", type: "uint256" },
+      { name: "_min_dy", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
 
 export class HemiLiquidator {
   /**
@@ -39,23 +41,23 @@ export class HemiLiquidator {
     return encodeFunctionData({
       abi: CURVE_ABI,
       functionName: "exchange",
-      args: [0n, 1n, amount, 0n], // Explicit BigInts for int128 safety
+      args: [0n, 1n, amount, 0n],
     });
   }
 
   async getRepaymentSwapData(hemiAmount: bigint, executor: Address, apiKey: string) {
-    const url = new URL(`https://api.1inch.dev/swap/v6.0/1/swap`);
+    const url = new URL("https://api.1inch.dev/swap/v6.0/1/swap");
     url.searchParams.set("src", HEMI_BTC);
     url.searchParams.set("dst", CRV_USD);
     url.searchParams.set("amount", hemiAmount.toString());
     url.searchParams.set("from", executor);
     url.searchParams.set("slippage", "1");
-    url.searchParams.set("disableEstimate", "true"); // Must be true for flashloan logic
+    url.searchParams.set("disableEstimate", "true");
 
     const res = await fetch(url.toString(), {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
     });
-    const json = await res.json();
+    const json = (await res.json()) as { tx: { to: string; data: string } };
     return { to: getAddress(json.tx.to), data: json.tx.data as Hex };
   }
 }

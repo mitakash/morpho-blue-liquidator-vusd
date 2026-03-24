@@ -39,7 +39,7 @@ export const chainConfigs: Record<number, Config> = {
         "0x1eda1b67414336cab3914316cb58339ddaef9e43f939af1fed162a989c98bc20",
 	"0xc48fbb6ac634123f64461e546a6e5bd06bbfa65adae19e9172a8bb4456b932ca",
       ],
-      checkProfit: true,
+      checkProfit: false,
       liquidationBufferBps: 50,
       useFlashbots: true,
       blockInterval: 2,
