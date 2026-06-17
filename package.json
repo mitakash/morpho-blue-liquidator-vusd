@@ -16,6 +16,8 @@
     "vusd:status": "tsx --env-file=.env apps/client/src/showVaultStatus.ts",
     "vusd:deposit": "tsx --env-file=.env apps/client/src/depositVUSD.ts",
     "vusd:redeem": "tsx --env-file=.env apps/client/src/redeemVUSD.ts",
+    "vusd:drip": "tsx --env-file=.env apps/client/src/dripYield.ts",
+    "vetbtc:drip": "tsx --env-file=.env apps/client/src/dripVetBTC.ts",
     "vusd:seed": "tsx --env-file=.env apps/client/src/seedVusdMarkets.ts"
   },
   "lint-staged": {
