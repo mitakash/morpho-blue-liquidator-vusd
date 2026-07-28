@@ -18,6 +18,8 @@
     "vusd:redeem": "tsx --env-file=.env apps/client/src/redeemVUSD.ts",
     "vusd:drip": "tsx --env-file=.env apps/client/src/dripYield.ts",
     "vetbtc:drip": "tsx --env-file=.env apps/client/src/dripVetBTC.ts",
+    "vusd:check-dilution": "tsx --env-file=.env apps/client/src/calculateTopUp.ts",
+    "vetbtc:check-dilution": "tsx --env-file=.env apps/client/src/calculateVetBTCTopUp.ts",
     "vusd:seed": "tsx --env-file=.env apps/client/src/seedVusdMarkets.ts"
   },
   "lint-staged": {
