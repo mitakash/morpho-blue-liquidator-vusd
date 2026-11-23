@@ -1,19 +1,94 @@
+// =============================================================================
+// FILE: apps/client/src/calculateVetBTCTopUp.ts
+// RUN:  pnpm vetbtc:check-dilution
+//
+// WHAT THIS SCRIPT DOES
+// It reads the svetBTC staking vault and the vetBTC YieldDistributor. It tells you
+// how much vetBTC you must send to distribute() so that svetBTC pays the target
+// APR over the next 7 day window.
+//
+// HOW THE PIECES CONNECT
+//   1. You call distribute(amount) on the YieldDistributor.
+//   2. The distributor holds a "pot". It releases the pot to the vault at
+//      rewardRate tokens per second until periodFinish.
+//   3. The pot that is still left at any moment is:
+//          remaining = rewardRate * (periodFinish - now)
+//   4. On every distribute() the contract computes:
+//          new pot = remaining + amount
+//      It then spreads the new pot over a fresh 7 day window.
+//   So the top up you need is:  target pot for 7 days  minus  remaining.
+//
+// PROBLEM THIS VERSION FIXES (found on 2026-11-22)
+// The old version took "now" from the local computer clock (Date.now()).
+// The contract takes "now" from the block timestamp. On 2026-11-22 the local
+// clock was about 3.9 days behind, because the machine was restored from an
+// old VM clone. The script then believed that much more time was left in the
+// window. It printed a "remaining" number that was far too high and a top up
+// that was far too low. Three drips were needed in place of one.
+//
+// SOLUTION
+//   A. "now" comes from the latest block timestamp. This is the same clock
+//      that the contract uses, so the two can no longer disagree.
+//   B. All contract reads are pinned to that same block number. A load
+//      balanced RPC cannot mix values from two different blocks.
+//   C. The script compares the local clock with the block time. It prints a
+//      warning when they differ by more than CLOCK_DRIFT_WARN_SECONDS. The
+//      math does not use the local clock. The warning only tells you that the
+//      machine clock needs attention.
+//   D. A shortfall smaller than TOLERANCE_BPS of the target counts as healthy.
+//      This stops advice such as "drip 0.00000003".
+//   E. The suggested amount is rounded up to the printed decimals. One drip
+//      then reaches the target and does not stop a tiny amount below it.
+//
+// NOTE ON THE CONTRACT VERSION
+// Since about 2026-11-16 the deployed distribute() settles accrued yield to
+// the vault before it reschedules. The manual sync deposit is not needed any
+// more. This script prints pendingYield() so you can still see that amount.
+// =============================================================================
+
 import dotenv from "dotenv";
 import { createPublicClient, formatUnits, http, parseAbi } from "viem";
 import { mainnet } from "viem/chains";
 
 dotenv.config();
 
-// Contract configurations from vetBTC deployment specifications
+// Contract addresses from the vetBTC deployment.
 const S_VETBTC_VAULT = "0x0cB9D84d4bcEc8d3D5B2d99a6F07f4605325987e";
 const VETBTC_YIELD_DISTRIBUTOR = "0xd74bcf1299176E98899bA2e86dD2C9aE089F5276";
+
+// Settings you may want to change.
+const TOKEN_SYMBOL = "vetBTC";
+const TOKEN_DECIMALS = 18;
+const TVL_DECIMALS = 6; // decimals printed for the pool TVL
+const AMOUNT_DECIMALS = 8; // decimals printed for yield amounts
+const DRIP_DECIMALS = 8; // decimals used in the suggested drip command
+const TARGET_APR_PERCENT = 5n; // 5% target for svetBTC
+const TOLERANCE_BPS = 50n; // 50 basis points = 0.5% of the target pot
+const CLOCK_DRIFT_WARN_SECONDS = 120n;
+const DRIP_COMMAND = "pnpm vetbtc:drip";
+
+const SECONDS_PER_YEAR = 31536000n;
+const RATE_PRECISION = 10n ** 18n; // rewardRate is scaled by 1e18 in the contract
 
 const minimalAbi = parseAbi([
   "function totalAssets() view returns (uint256)",
   "function rewardRate() view returns (uint256)",
   "function periodFinish() view returns (uint256)",
   "function yieldDuration() view returns (uint256)",
+  "function pendingYield() view returns (uint256)",
 ]);
+
+// Format a token amount in wei as a string with a fixed number of decimals.
+function fmt(amountWei: bigint, decimals: number): string {
+  return Number(formatUnits(amountWei, TOKEN_DECIMALS)).toFixed(decimals);
+}
+
+// Round a wei amount UP to the decimals used in the drip command.
+// Example with 8 decimals: 0.000021371 becomes 0.00002138.
+function roundUpToDripDecimals(amountWei: bigint): bigint {
+  const unit = 10n ** BigInt(TOKEN_DECIMALS - DRIP_DECIMALS);
+  return ((amountWei + unit - 1n) / unit) * unit;
+}
 
 async function main() {
   const client = createPublicClient({
@@ -21,98 +96,156 @@ async function main() {
     transport: http(process.env.RPC_URL_1 ?? process.env.RPC_URL_1_BACKUP),
   });
 
-  console.log("🔍 ANALYZING VETBTC PROTOCOL DILUTION STATES...");
+  console.log(`ANALYZING s${TOKEN_SYMBOL} YIELD STATE`);
 
-  // 1. Fetch live metrics across the system
-  const [totalAssets, rewardRate, periodFinish, yieldDuration] =
+  // ---------------------------------------------------------------------------
+  // STEP 1: Take one block as the single source of truth.
+  // block.timestamp is the clock the contract uses. block.number pins all
+  // reads below to the same state.
+  // ---------------------------------------------------------------------------
+  const block = await client.getBlock({ blockTag: "latest" });
+  const now = block.timestamp;
+  const blockNumber = block.number;
+
+  console.log(
+    `- Block: ${blockNumber} (block time ${new Date(Number(now) * 1000).toISOString()})`
+  );
+
+  // ---------------------------------------------------------------------------
+  // STEP 2: Clock check. The local clock is NOT used in any formula below.
+  // A normal difference is a few seconds, because blocks arrive every 12
+  // seconds. A large difference means the machine clock is wrong.
+  // ---------------------------------------------------------------------------
+  const localNow = BigInt(Math.floor(Date.now() / 1000));
+  const drift = localNow - now;
+  const absDrift = drift < 0n ? -drift : drift;
+  if (absDrift > CLOCK_DRIFT_WARN_SECONDS) {
+    console.log(
+      `WARNING: local clock differs from block time by ${drift} seconds ` +
+        `(${(Number(drift) / 86400).toFixed(2)} days).`
+    );
+    console.log(
+      "         The numbers below use block time, so they are still correct."
+    );
+    console.log(
+      "         Fix the machine clock (check with: timedatectl) or the RPC node is stale."
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 3: Read all values at the same block.
+  // ---------------------------------------------------------------------------
+  const [totalAssets, rewardRate, periodFinish, yieldDuration, pendingYield] =
     await Promise.all([
       client.readContract({
         address: S_VETBTC_VAULT,
         abi: minimalAbi,
         functionName: "totalAssets",
+        blockNumber,
       }),
       client.readContract({
         address: VETBTC_YIELD_DISTRIBUTOR,
         abi: minimalAbi,
         functionName: "rewardRate",
+        blockNumber,
       }),
       client.readContract({
         address: VETBTC_YIELD_DISTRIBUTOR,
         abi: minimalAbi,
         functionName: "periodFinish",
+        blockNumber,
       }),
       client.readContract({
         address: VETBTC_YIELD_DISTRIBUTOR,
         abi: minimalAbi,
         functionName: "yieldDuration",
+        blockNumber,
+      }),
+      client.readContract({
+        address: VETBTC_YIELD_DISTRIBUTOR,
+        abi: minimalAbi,
+        functionName: "pendingYield",
+        blockNumber,
       }),
     ]);
 
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const SECONDS_PER_YEAR = 31536000n;
+  // ---------------------------------------------------------------------------
+  // STEP 4: Remaining pot, measured from block time.
+  // This is the same value the contract adds your amount to in distribute().
+  // ---------------------------------------------------------------------------
+  const secondsLeft = periodFinish > now ? periodFinish - now : 0n;
+  const remainingYieldWei = (secondsLeft * rewardRate) / RATE_PRECISION;
 
-  // 2. Compute remaining un-dripped yield in Wei
-  let remainingYieldWei = 0n;
-  if (periodFinish > now) {
-    remainingYieldWei = ((periodFinish - now) * rewardRate) / 10n ** 18n;
+  console.log(
+    `- Current s${TOKEN_SYMBOL} Pool TVL: ${fmt(totalAssets, TVL_DECIMALS)} ${TOKEN_SYMBOL}`
+  );
+  console.log(
+    `- Remaining un-dripped yield: ${fmt(remainingYieldWei, AMOUNT_DECIMALS)} ${TOKEN_SYMBOL}`
+  );
+  console.log(
+    `- Time left in current window: ${(Number(secondsLeft) / 86400).toFixed(2)} days ` +
+      `(${secondsLeft} seconds)`
+  );
+  console.log(
+    `- Accrued, not yet settled to vault: ${fmt(pendingYield, AMOUNT_DECIMALS)} ${TOKEN_SYMBOL} ` +
+      "(the next distribute() settles it)"
+  );
+  if (secondsLeft === 0n) {
+    console.log(
+      "- NOTE: the window has ended. The vault earns nothing until the next drip."
+    );
   }
 
-  const currentTVL = Number(formatUnits(totalAssets, 18));
-  const currentRemaining = Number(formatUnits(remainingYieldWei, 18));
-
-  console.log(`- Current svetBTC Pool TVL: ${currentTVL.toFixed(6)} vetBTC`);
-  console.log(
-    `- Remaining Un-dripped Yield: ${currentRemaining.toFixed(8)} vetBTC`
-  );
-
-  // 3. Compute Required Top-Up for a Fresh 7-Day Window
-  const TARGET_APR_BASIS = 5n; // 5% Target for vetBTC
-
-  // Total yield required over a full 7-day window (yieldDuration) to achieve 5% APY on totalAssets
-  const required7DayYieldWei =
-    (totalAssets * TARGET_APR_BASIS * yieldDuration) /
+  // ---------------------------------------------------------------------------
+  // STEP 5: Target pot for a fresh 7 day window, and the top up needed.
+  //   target pot = TVL * APR * yieldDuration / one year
+  //   top up     = target pot - remaining
+  // ---------------------------------------------------------------------------
+  const requiredPotWei =
+    (totalAssets * TARGET_APR_PERCENT * yieldDuration) /
     (100n * SECONDS_PER_YEAR);
 
-  // Top-up needed is the difference between target 7-day yield and what's already queued
-  const topUpRequiredWei =
-    required7DayYieldWei > remainingYieldWei
-      ? required7DayYieldWei - remainingYieldWei
+  const shortfallWei =
+    requiredPotWei > remainingYieldWei
+      ? requiredPotWei - remainingYieldWei
       : 0n;
 
-  const topUpRequired = Number(formatUnits(topUpRequiredWei, 18));
+  const toleranceWei = (requiredPotWei * TOLERANCE_BPS) / 10000n;
 
-  // Calculate effective APR if we do NOT top up over the next full 7 days
-  const projectedAnnualizedYield =
-    (remainingYieldWei * SECONDS_PER_YEAR) / yieldDuration;
+  // APR over the next full window if you drip nothing more. A drip of any
+  // size restarts the window with pot = remaining + amount.
   const projectedApr =
-    totalAssets > 0n
-      ? (Number(projectedAnnualizedYield) / Number(totalAssets)) * 100
+    totalAssets > 0n && yieldDuration > 0n
+      ? (Number(remainingYieldWei) * Number(SECONDS_PER_YEAR) * 100) /
+        (Number(yieldDuration) * Number(totalAssets))
       : 0;
 
-  console.log("\n📊 VETBTC DILUTION COMPENSATOR RESULT:");
-  if (topUpRequiredWei <= 0n) {
+  console.log("\nRESULT:");
+  console.log(
+    `- Target: ${TARGET_APR_PERCENT}% APR needs a pot of ${fmt(requiredPotWei, AMOUNT_DECIMALS)} ${TOKEN_SYMBOL} per window`
+  );
+  console.log(
+    `- Projected APR from the remaining pot alone: ${projectedApr.toFixed(2)}%`
+  );
+
+  if (shortfallWei <= toleranceWei) {
     console.log(
-      "✅ The current vetBTC drip rate is healthy over the next 7-day window!"
+      `- HEALTHY: the remaining pot is within ${Number(TOLERANCE_BPS) / 100}% of the target. No top up needed.`
     );
   } else {
+    const suggestedWei = roundUpToDripDecimals(shortfallWei);
     console.log(
-      "❌ Dilution Detected! To maintain 5% APR for the upcoming 7-day window:"
+      `- TOP UP NEEDED: ${fmt(shortfallWei, AMOUNT_DECIMALS)} ${TOKEN_SYMBOL} to reach ${TARGET_APR_PERCENT}% APR`
     );
-    console.log(
-      `👉 You need to inject an additional: **${topUpRequired.toFixed(8)} vetBTC**`
-    );
-    console.log(
-      "\nRun this exact command to extend the 7-day window to 5% APR immediately:"
-    );
+    console.log("\nRun this command:");
     console.log(
       "\x1b[36m%s\x1b[0m",
-      `pnpm vetbtc:drip ${topUpRequired.toFixed(8)}`
+      `${DRIP_COMMAND} ${fmt(suggestedWei, DRIP_DECIMALS)}`
     );
   }
-
-  console.log(
-    `\n📈 Projected 7-Day Active Yield APR: ${projectedApr.toFixed(2)}%`
-  );
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
