@@ -1,102 +1,265 @@
-import { createWalletClient, http, publicActions, parseUnits, getAddress, erc20Abi, type Hex } from "viem";
+// =============================================================================
+// FILE: apps/client/src/dripVetBTC.ts
+// RUN:  pnpm vetbtc:drip <amount>    example: pnpm vetbtc:drip 0.00002138
+//
+// WHAT THIS SCRIPT DOES
+// It sends vetBTC to the VetBTCYieldDistributor with distribute(amount). The
+// distributor then releases the pot to the svetBTC vault over the next 7 days.
+//
+// HOW THE PIECES CONNECT
+//   1. approve(distributor, amount) on vetBTC.
+//   2. distribute(amount) on the VetBTCYieldDistributor. Inside this call the
+//      contract does three things:
+//        a. It settles yield that already accrued to the vault (YieldPulled).
+//        b. It computes: new pot = remaining + amount.
+//        c. It starts a fresh 7 day window with rewardRate = new pot / 7 days.
+//      It then emits YieldDistributed(distributor, amount, newRewardRate,
+//      periodFinish).
+//
+// PROBLEM THIS VERSION FIXES (found on 2026-11-22)
+// The old version printed only "SUCCESS". To learn the result you had to run
+// the check-dilution script. That script used the local computer clock, and
+// the clock was wrong, so the result looked wrong and you dripped three times.
+//
+// SOLUTION
+// After the transaction confirms, this script decodes the YieldDistributed
+// event from the receipt. The event holds the exact new rewardRate that the
+// contract stored. From it the script prints:
+//   - the yield settled to the vault in this transaction
+//   - the remaining pot that the contract used
+//   - the new pot and the new window end
+//   - the new projected APR, compared with the target
+// These numbers come only from the chain. No local clock is involved. You do
+// not need a second check to know what the drip did.
+// =============================================================================
+
+import {
+  createWalletClient,
+  http,
+  publicActions,
+  parseUnits,
+  formatUnits,
+  getAddress,
+  erc20Abi,
+  parseAbi,
+  parseEventLogs,
+  type Hex,
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { mainnet } from "viem/chains";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-// VetBTC-specific configuration verified from contract specifications
+// Contract addresses from the vetBTC deployment.
 const VETBTC_ADDR = getAddress("0xf196C68233464A16CFDa319a47c21f4cECa62001");
+const S_VETBTC_VAULT_ADDR = getAddress("0x0cB9D84d4bcEc8d3D5B2d99a6F07f4605325987e");
 const VETBTC_YIELD_DISTRIBUTOR_ADDR = getAddress("0xd74bcf1299176E98899bA2e86dD2C9aE089F5276");
 
-// Minimal inline ABI for YieldDistributor spec compliance
-const yieldDistributorAbi = [
-    {
-        inputs: [{ name: "amount_", type: "uint256" }],
-        name: "distribute",
-        outputs: [],
-        stateMutability: "nonpayable",
-        type: "function"
-    }
-] as const;
+// Settings you may want to change. Keep the target equal to calculateVetBTCTopUp.ts.
+const TOKEN_SYMBOL = "vetBTC";
+const DISPLAY_DECIMALS = 8;
+const TARGET_APR_PERCENT = 5; // used only for the comparison line at the end
+const TOLERANCE_PERCENT_OF_TARGET = 0.5; // same 0.5% tolerance as the checker
 
-async function main() {
-    // Read CLI args similar to dripYield pattern
-    const arg = process.argv[2];
-    if (!arg) {
-        throw new Error("Usage: npx tsx apps/client/src/dripVetBTC.ts <amount> (e.g., 0.05)");
-    }
+const SECONDS_PER_YEAR = 31536000n;
+const RATE_PRECISION = 10n ** 18n; // rewardRate is scaled by 1e18 in the contract
 
-    // Initialize environment variables mapping to PK 1
-    const pk = process.env.LIQUIDATION_PRIVATE_KEY_1 as Hex;
-    if (!pk) throw new Error("Missing LIQUIDATION_PRIVATE_KEY_1 in your .env file.");
+const yieldDistributorAbi = parseAbi([
+  "function distribute(uint256 amount_)",
+  "function yieldDuration() view returns (uint256)",
+  "event YieldDistributed(address indexed distributor, uint256 amount, uint256 newRewardRate, uint256 periodFinish)",
+  "event YieldPulled(uint256 amount)",
+]);
 
-    const account = privateKeyToAccount(pk);
-    const client = createWalletClient({ 
-        account, 
-        chain: mainnet, 
-        transport: http(process.env.RPC_URL_1)
-    }).extend(publicActions);
+const vaultAbi = parseAbi(["function totalAssets() view returns (uint256)"]);
 
-    console.log(`\n🧡 INITIATING VETBTC YIELD DRIP CYCLE`);
-    console.log(`- Operating Wallet (EOA): ${account.address}`);
-    console.log(`- Yield Target Amount: ${arg} vetBTC`);
+// Token decimals. main() reads the real value from the vetBTC contract before
+// any amount is parsed or printed. 18 is only the starting value.
+let TOKEN_DECIMALS = 18;
 
-    // 1. Dynamic Decimals Pre-flight Check
-    console.log("🔍 Fetching token decimals from vetBTC contract...");
-    const decimals = await client.readContract({
-        address: VETBTC_ADDR,
-        abi: erc20Abi,
-        functionName: 'decimals'
-    });
-    console.log(`✅ Detected vetBTC Decimals: ${decimals}`);
-
-    const amountToDrip = parseUnits(arg, decimals);
-
-    // 2. Balance Pre-flight Check
-    const currentBalance = await client.readContract({
-        address: VETBTC_ADDR,
-        abi: erc20Abi,
-        functionName: 'balanceOf',
-        args: [account.address]
-    });
-
-    if (currentBalance < amountToDrip) {
-        throw new Error(`Insufficient funds. Your wallet has ${Number(currentBalance) / (10 ** decimals)} vetBTC, but you requested to drip ${arg} vetBTC.`);
-    }
-
-    // 3. Step 1: ERC20 Allowance Approval
-    console.log("\n🛠️ Step 1: Granting vetBTC allowance to VetBTCYieldDistributor...");
-    const approveHash = await client.writeContract({
-        address: VETBTC_ADDR,
-        abi: erc20Abi,
-        functionName: 'approve',
-        args: [VETBTC_YIELD_DISTRIBUTOR_ADDR, amountToDrip]
-    });
-    
-    console.log(`⏳ Waiting for approval confirmation: ${approveHash}`);
-    await client.waitForTransactionReceipt({ hash: approveHash });
-    console.log("✅ Spend allowance successfully approved.");
-
-    // 4. Step 2: Push Yield to Linear Drip System
-    console.log("\n🚀 Step 2: Routing assets to distribute()...");
-    const distributeHash = await client.writeContract({
-        address: VETBTC_YIELD_DISTRIBUTOR_ADDR,
-        abi: yieldDistributorAbi,
-        functionName: 'distribute',
-        args: [amountToDrip]
-    });
-
-    console.log(`⏳ Waiting for linear drip activation: ${distributeHash}`);
-    const receipt = await client.waitForTransactionReceipt({ hash: distributeHash });
-
-    if (receipt.status === 'success') {
-        console.log(`\n🎉 SUCCESS! vetBTC Linear drip window extended.`);
-        console.log(`- Transaction confirmed in block: ${receipt.blockNumber}`);
-        console.log(`- Your tokens are now dripping linearly to svetBTC over the protocol window.`);
-    } else {
-        console.error("❌ Transaction execution reverted on-chain.");
-    }
+// Format a token amount in wei as a string with a fixed number of decimals.
+function fmt(amountWei: bigint): string {
+  return Number(formatUnits(amountWei, TOKEN_DECIMALS)).toFixed(DISPLAY_DECIMALS);
 }
 
-main().catch(console.error);
+async function main() {
+  // Read the amount from the command line.
+  const arg = process.argv[2];
+  if (!arg) {
+    throw new Error("Usage: npx tsx apps/client/src/dripVetBTC.ts <amount> (e.g., 0.00002138)");
+  }
+
+  const pk = process.env.LIQUIDATION_PRIVATE_KEY_1 as Hex;
+  if (!pk) throw new Error("Missing LIQUIDATION_PRIVATE_KEY_1 in your .env file.");
+
+  const account = privateKeyToAccount(pk);
+  const client = createWalletClient({
+    account,
+    chain: mainnet,
+    transport: http(process.env.RPC_URL_1),
+  }).extend(publicActions);
+
+  console.log("\nINITIATING VETBTC YIELD DRIP");
+  console.log(`- Operating Wallet (EOA): ${account.address}`);
+  console.log(`- Amount: ${arg} ${TOKEN_SYMBOL}`);
+
+  // ---------------------------------------------------------------------------
+  // STEP 0a: Read token decimals from the vetBTC contract, then parse the amount.
+  // ---------------------------------------------------------------------------
+  TOKEN_DECIMALS = await client.readContract({
+    address: VETBTC_ADDR,
+    abi: erc20Abi,
+    functionName: "decimals",
+  });
+  console.log(`- vetBTC decimals: ${TOKEN_DECIMALS}`);
+
+  const amountToDrip = parseUnits(arg, TOKEN_DECIMALS);
+  if (amountToDrip === 0n) {
+    throw new Error("Amount must be greater than zero. distribute(0) reverts with ZeroAmount.");
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 0b: Balance check before any transaction is sent.
+  // ---------------------------------------------------------------------------
+  const currentBalance = await client.readContract({
+    address: VETBTC_ADDR,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [account.address],
+  });
+
+  if (currentBalance < amountToDrip) {
+    throw new Error(
+      `Insufficient funds. Your wallet has ${formatUnits(currentBalance, TOKEN_DECIMALS)} ${TOKEN_SYMBOL}, ` +
+        `but you requested to drip ${arg} ${TOKEN_SYMBOL}.`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // STEP 1: Approve the distributor to take the amount.
+  // ---------------------------------------------------------------------------
+  console.log("\nStep 1: Granting vetBTC allowance to VetBTCYieldDistributor...");
+  const approveHash = await client.writeContract({
+    address: VETBTC_ADDR,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [VETBTC_YIELD_DISTRIBUTOR_ADDR, amountToDrip],
+  });
+
+  console.log(`Waiting for approval confirmation: ${approveHash}`);
+  const approveReceipt = await client.waitForTransactionReceipt({ hash: approveHash });
+  if (approveReceipt.status !== "success") {
+    throw new Error("Approval transaction reverted. Nothing was distributed.");
+  }
+  console.log("Allowance approved.");
+
+  // ---------------------------------------------------------------------------
+  // STEP 2: Call distribute().
+  // ---------------------------------------------------------------------------
+  console.log("\nStep 2: Calling distribute()...");
+  const distributeHash = await client.writeContract({
+    address: VETBTC_YIELD_DISTRIBUTOR_ADDR,
+    abi: yieldDistributorAbi,
+    functionName: "distribute",
+    args: [amountToDrip],
+  });
+
+  console.log(`Waiting for distribute confirmation: ${distributeHash}`);
+  const receipt = await client.waitForTransactionReceipt({ hash: distributeHash });
+
+  if (receipt.status !== "success") {
+    console.error("ERROR: distribute() reverted on chain. Nothing was distributed.");
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`\nSUCCESS. Confirmed in block ${receipt.blockNumber}.`);
+
+  // ---------------------------------------------------------------------------
+  // STEP 3: Verify the result from the receipt itself.
+  // The events are emitted by the distributor inside our transaction, so they
+  // show exactly what the contract stored.
+  // ---------------------------------------------------------------------------
+  const distributorLogs = receipt.logs.filter(
+    (log) => getAddress(log.address) === VETBTC_YIELD_DISTRIBUTOR_ADDR
+  );
+  const distributedEvents = parseEventLogs({
+    abi: yieldDistributorAbi,
+    eventName: "YieldDistributed",
+    logs: distributorLogs,
+  });
+  const pulledEvents = parseEventLogs({
+    abi: yieldDistributorAbi,
+    eventName: "YieldPulled",
+    logs: distributorLogs,
+  });
+
+  const distributed = distributedEvents[0];
+  if (!distributed) {
+    console.log(
+      "WARNING: no YieldDistributed event found in the receipt. Run pnpm vetbtc:check-dilution to verify."
+    );
+    return;
+  }
+
+  // YieldPulled is missing when nothing had accrued. That is normal.
+  const settledWei = pulledEvents.reduce((sum, e) => sum + e.args.amount, 0n);
+
+  // Read the window length and the vault TVL at the block of our transaction.
+  const [yieldDuration, totalAssets] = await Promise.all([
+    client.readContract({
+      address: VETBTC_YIELD_DISTRIBUTOR_ADDR,
+      abi: yieldDistributorAbi,
+      functionName: "yieldDuration",
+      blockNumber: receipt.blockNumber,
+    }),
+    client.readContract({
+      address: S_VETBTC_VAULT_ADDR,
+      abi: vaultAbi,
+      functionName: "totalAssets",
+      blockNumber: receipt.blockNumber,
+    }),
+  ]);
+
+  // new pot = newRewardRate * yieldDuration. This inverts the contract formula
+  // rewardRate = newTotal * 1e18 / yieldDuration.
+  const newPotWei = (distributed.args.newRewardRate * yieldDuration) / RATE_PRECISION;
+  const remainingUsedWei =
+    newPotWei > distributed.args.amount ? newPotWei - distributed.args.amount : 0n;
+
+  const newApr =
+    totalAssets > 0n && yieldDuration > 0n
+      ? (Number(newPotWei) * Number(SECONDS_PER_YEAR) * 100) /
+        (Number(yieldDuration) * Number(totalAssets))
+      : 0;
+
+  // Print one aligned "label: value" line.
+  const line = (label: string, value: string) =>
+    console.log(`- ${(label + ":").padEnd(45)}${value}`);
+
+  console.log("\nRESULT FROM CHAIN EVENTS:");
+  line("Yield settled to vault in this transaction", `${fmt(settledWei)} ${TOKEN_SYMBOL}`);
+  line("Remaining pot the contract used", `${fmt(remainingUsedWei)} ${TOKEN_SYMBOL}`);
+  line("Amount added", `${fmt(distributed.args.amount)} ${TOKEN_SYMBOL}`);
+  line("New pot for the next window", `${fmt(newPotWei)} ${TOKEN_SYMBOL}`);
+  line("Window ends", new Date(Number(distributed.args.periodFinish) * 1000).toISOString());
+  line(`s${TOKEN_SYMBOL} Pool TVL`, `${fmt(totalAssets)} ${TOKEN_SYMBOL}`);
+  line("New projected APR", `${newApr.toFixed(2)}%`);
+
+  // Comparison with the target. This is information only. You may drip a
+  // different amount on purpose.
+  const lowestOkApr = TARGET_APR_PERCENT * (1 - TOLERANCE_PERCENT_OF_TARGET / 100);
+  if (newApr >= lowestOkApr) {
+    console.log(`- Target ${TARGET_APR_PERCENT}% APR: REACHED`);
+  } else {
+    console.log(
+      `- Target ${TARGET_APR_PERCENT}% APR: NOT REACHED. Run pnpm vetbtc:check-dilution for the exact top up.`
+    );
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
